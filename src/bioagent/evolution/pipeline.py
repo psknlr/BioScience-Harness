@@ -54,6 +54,9 @@ class Proposal:
     stage_log: list[dict[str, Any]] = field(default_factory=list)
     incumbent_score: float | None = None
     candidate_score: float | None = None
+    #: per-benchmark scores, so a regression on one cannot be averaged away
+    benchmark_scores: dict[str, float] = field(default_factory=dict)
+    incumbent_scores: dict[str, float] = field(default_factory=dict)
     diff: str = ""
 
     def log(self, stage: str, ok: bool, detail: str) -> None:
@@ -83,6 +86,8 @@ class EvolutionPipeline:
                  benchmark_runner: Callable[[ComponentManifest, str], BenchmarkResult] | None = None,
                  policy_check: Callable[[ComponentManifest], tuple[bool, str]] | None = None,
                  min_improvement: float = 0.0,
+                 regression_tolerance: float = 0.0,
+                 min_absolute_score: float = 0.0,
                  workspace: Any = None, git: Any = None,
                  smoke_runner: Callable[[ComponentManifest], tuple[bool, str]] | None = None) -> None:
         self.registry = registry
@@ -94,8 +99,60 @@ class EvolutionPipeline:
         self._smoke = smoke_runner or getattr(reloader, "_smoke", None) or (lambda m: (True, "no smoke test"))
         self._policy_check = policy_check or (lambda m: (True, "no extra policy configured"))
         self.min_improvement = min_improvement
+        #: How far any single benchmark may fall below the incumbent, however
+        #: well the others do. Averaging alone lets a large win on one benchmark
+        #: hide a correctness or safety regression on another.
+        self.regression_tolerance = regression_tolerance
+        #: Floor a component with no incumbent must clear. Without it the score
+        #: gate was guarded by `incumbent is not None`, so a brand-new component
+        #: scoring 0.0 on every benchmark was promoted unchecked.
+        self.min_absolute_score = min_absolute_score
         self.workspace = workspace
         self.git = git
+
+    def _benchmark_verdict(self, proposal: "Proposal", incumbent: Any,
+                           bms: tuple[str, ...]) -> tuple[bool, str]:
+        """Decide promotion from every benchmark, not an average of one.
+
+        Three conditions, all required:
+        1. every declared benchmark actually produced a score;
+        2. no single benchmark regressed past `regression_tolerance`;
+        3. the mean beat the incumbent by `min_improvement` — or, with no
+           incumbent, every benchmark cleared `min_absolute_score`.
+        """
+        missing = [b for b in bms if b not in proposal.benchmark_scores]
+        if missing:
+            return False, f"benchmarks did not run: {', '.join(missing)}"
+
+        if incumbent is None:
+            weak = {b: sc for b, sc in proposal.benchmark_scores.items()
+                    if sc < self.min_absolute_score}
+            if weak:
+                return False, ("no incumbent to compare against, and "
+                               + ", ".join(f"{b} {sc:.3f}" for b, sc in weak.items())
+                               + f" below the required {self.min_absolute_score:.3f}")
+            return True, ("no incumbent; all "
+                          f"{len(bms)} benchmark(s) at or above {self.min_absolute_score:.3f} "
+                          f"(mean {proposal.candidate_score:.3f})")
+
+        regressions = {
+            b: (sc, proposal.incumbent_scores.get(b, 0.0))
+            for b, sc in proposal.benchmark_scores.items()
+            if (proposal.incumbent_scores.get(b, 0.0) - sc) > self.regression_tolerance
+        }
+        if regressions:
+            return False, ("regression on " + ", ".join(
+                f"{b}: {c:.3f} vs incumbent {i:.3f}" for b, (c, i) in regressions.items()))
+
+        gain = (proposal.candidate_score or 0.0) - (proposal.incumbent_score or 0.0)
+        if gain <= self.min_improvement:
+            return False, (f"mean over {len(bms)} benchmark(s): candidate "
+                           f"{proposal.candidate_score:.3f} vs incumbent "
+                           f"{proposal.incumbent_score:.3f} "
+                           f"(gain {gain:+.3f} <= {self.min_improvement})")
+        return True, (f"{len(bms)} benchmark(s), no regression; mean candidate "
+                      f"{proposal.candidate_score:.3f} vs incumbent "
+                      f"{proposal.incumbent_score:.3f} (gain {gain:+.3f})")
 
     # ------------------------------------------------------------------ stages
     def submit(self, proposal: Proposal, *, events: EventLog | None = None,
@@ -136,24 +193,29 @@ class EvolutionPipeline:
         incumbent = self.registry.get(proposal.component.id)
         bms = proposal.component.validation.benchmarks or ()
         if self._benchmark and bms:
-            cand = self._benchmark(proposal.component, bms[0])
-            proposal.candidate_score = cand.score
+            # Every declared benchmark runs. Scoring only `bms[0]` meant a
+            # candidate that improved the first benchmark was promoted while a
+            # declared safety or regression benchmark it broke was never run.
+            for bm in bms:
+                cand = self._benchmark(proposal.component, bm)
+                proposal.benchmark_scores[bm] = cand.score
+                if incumbent is not None:
+                    inc = self._benchmark(incumbent, bm)
+                    proposal.incumbent_scores[bm] = inc.score
+            scores = list(proposal.benchmark_scores.values())
+            proposal.candidate_score = sum(scores) / len(scores) if scores else 0.0
             if incumbent is not None:
-                inc = self._benchmark(incumbent, bms[0])
-                proposal.incumbent_score = inc.score
-            gain = (proposal.candidate_score or 0) - (proposal.incumbent_score or 0)
-            if incumbent is not None and gain <= self.min_improvement:
+                inc_scores = list(proposal.incumbent_scores.values())
+                proposal.incumbent_score = (sum(inc_scores) / len(inc_scores)
+                                            if inc_scores else 0.0)
+
+            ok, msg = self._benchmark_verdict(proposal, incumbent, bms)
+            if not ok:
                 proposal.state = ProposalState.QUARANTINED
-                msg = (f"benchmark {bms[0]}: candidate {proposal.candidate_score:.3f} "
-                       f"vs incumbent {proposal.incumbent_score:.3f} "
-                       f"(gain {gain:+.3f} <= {self.min_improvement})")
                 proposal.log("benchmark", False, msg)
                 self._emit(events, EventType.EVALUATION_COMPLETED, proposal, ev, msg)
                 return proposal
-            proposal.log("benchmark", True,
-                         f"{bms[0]}: candidate {proposal.candidate_score:.3f}"
-                         + (f" vs incumbent {proposal.incumbent_score:.3f}"
-                            if proposal.incumbent_score is not None else " (no incumbent)"))
+            proposal.log("benchmark", True, msg)
             self._emit(events, EventType.EVALUATION_COMPLETED, proposal, ev,
                        proposal.stage_log[-1]["detail"])
         else:

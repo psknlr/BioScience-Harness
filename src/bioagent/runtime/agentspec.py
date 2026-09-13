@@ -16,7 +16,8 @@ from typing import Any, Sequence
 
 from ..adapters.base import CallResult
 from ..backends.base import BackendRegistry
-from ..planners.base import Critique, Plan, PlannerPlugin, get_planner
+from ..planners.base import (Critique, Plan, PlannerPlugin, get_planner,
+                             merge_step_arguments)
 from ..policy import AuthorizationRequest, PolicyKernel
 from ..status import ExecutionStatus, LifecycleState, RunOutcome, ScientificVerdict
 from .component import ComponentManifest
@@ -90,9 +91,16 @@ class RunReport:
 
     @property
     def verdict(self) -> str:
-        """Did the science hold? Taken from the critique, never from exit codes."""
+        """Did the science hold? Taken from the critique, never from exit codes.
+
+        A critique that only watched steps execute reports INCONCLUSIVE, so a run
+        cannot be `ok` until a validator has actually judged the result.
+        """
         if self.critique is None:
             return ScientificVerdict.INCONCLUSIVE.value
+        declared = getattr(self.critique, "verdict", None)
+        if declared in tuple(v.value for v in ScientificVerdict):
+            return declared
         return (ScientificVerdict.ACCEPTED.value if self.critique.accepted
                 else ScientificVerdict.REJECTED.value)
 
@@ -141,10 +149,24 @@ class Runtime:
         # A resolver we build ourselves asks *this runtime's* backends whether a
         # mechanism can run, rather than assuming (the resolver used to declare
         # every container component unavailable regardless of the machine).
-        self.resolver = resolver or Resolver(registry, backend_probe=self._backend_probe)
+        self.resolver = resolver or Resolver(registry, backend_probe=self._backend_probe,
+                                             dataset_probe=self._dataset_probe)
         self.loader = loader or Loader(registry, self.resolver)
         self.catalogue_version = catalogue_version
         self.git_commit = git_commit
+
+    def _dataset_probe(self, name: str) -> bool:
+        """Is this dataset present for a backend that could actually read it?
+
+        Without this the resolver's default probe answered False for everything,
+        so dataset components were unavailable even with the file on disk, and a
+        successful auto-fetch changed nothing.
+        """
+        for backend in self.backends.all():
+            probe = getattr(backend, "has_dataset", None)
+            if callable(probe) and probe(name):
+                return True
+        return False
 
     def _backend_probe(self, backend: str) -> tuple[bool, str]:
         """Can this runtime actually execute that mechanism, here and now?"""
@@ -266,6 +288,49 @@ class Runtime:
                                 "error": res.error})
         return res
 
+    def invoke_manifest(self, manifest: ComponentManifest, *, spec: AgentSpec,
+                        events: EventLog | None = None, parent_event: str | None = None,
+                        **kwargs: Any) -> CallResult:
+        """Invoke a manifest that is not (or not yet) in the registry.
+
+        This is the path for scoring an evolution candidate, and it goes through
+        the same gates as `invoke()`: resolve, POLICY, backend. Two defects made
+        that necessary.
+
+        *The candidate was not the thing being executed.* Evolution scored a
+        candidate by handing the manifest straight to a backend, but
+        `PythonBackend` resolves an entrypoint via `Loader.load(manifest.id)`,
+        and a candidate normally carries the incumbent's id — so the loader
+        looked the id up in the production registry and ran the **incumbent**.
+        A benchmark that reported "the candidate improved" was comparing the old
+        version against itself. The fix is a scratch execution context: a
+        registry holding the candidate in place of the incumbent, its own
+        resolver and loader, and backends rebound to that loader, so the only
+        implementation reachable is the candidate's.
+
+        *Policy was skipped.* The old path went `resolve_manifest -> invoke`,
+        never consulting the kernel, so a candidate that production would DENY
+        still executed during benchmarking. Authorization happens here, on the
+        same lineage-propagating request `invoke()` builds.
+        """
+        scratch_registry = ComponentRegistry(
+            [m for m in self.registry if m.id != manifest.id])
+        scratch_registry.add(manifest)
+        scratch_resolver = Resolver(
+            scratch_registry,
+            dataset_probe=self.resolver._dataset_probe,
+            service_probe=self.resolver._service_probe,
+            backend_probe=self.resolver._backend_probe)
+        scratch_loader = Loader(scratch_registry, scratch_resolver)
+        scratch_backends = BackendRegistry(
+            [b.rebind(scratch_loader) for b in self.backends.all()])
+        scratch = Runtime(scratch_registry, scratch_backends, kernel=self.kernel,
+                          resolver=scratch_resolver, loader=scratch_loader,
+                          catalogue_version=self.catalogue_version,
+                          git_commit=self.git_commit, downloader=self.downloader)
+        return scratch.invoke(manifest.id, spec=spec, events=events,
+                              parent_event=parent_event, **kwargs)
+
     # --------------------------------------------------------------------- run
     def run(self, task: str, spec: AgentSpec, *, planner: PlannerPlugin | None = None,
             step_kwargs: dict | None = None) -> RunReport:
@@ -282,7 +347,7 @@ class Runtime:
             plan.steps = [s for s in plan.steps if s.component_id not in excluded]
             results = [self.invoke(s.component_id, spec=spec, events=events,
                                    parent_event=root, attempt=attempt,
-                                   **(step_kwargs or {}))
+                                   **merge_step_arguments(s, step_kwargs))
                        for s in plan.steps]
             every.extend(results)
             crit = pl.critique(plan, results)

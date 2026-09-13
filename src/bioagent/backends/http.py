@@ -107,7 +107,14 @@ class HTTPRequest:
         return urllib.parse.urlsplit(self.url).hostname or ""
 
     def key(self) -> str:
+        """Cache key covering everything that changes the response.
+
+        `accept` is sent on the wire but was missing here, so JSON and CSV
+        representations of one URL collided on a single entry and the second
+        caller silently got the first caller's format.
+        """
         blob = json.dumps({"u": self.full_url, "m": self.method, "h": dict(self.headers),
+                           "a": self.accept,
                            "j": self.json_body, "d": self.data.decode("latin1") if self.data else None},
                           sort_keys=True, default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:32]
@@ -275,7 +282,15 @@ class HTTPBackend(Backend):
         url = base + ("/" + path.lstrip("/") if path else "")
         host = urllib.parse.urlsplit(url).hostname or ""
         allowed = {h.lower() for h in manifest.permissions.network}
-        if allowed and host.lower() not in allowed:
+        # Deny by default. `if allowed and ...` inverted the rule the docstring
+        # states: a component declaring no hosts skipped the check entirely, so
+        # an empty permissions.network was the most permissive setting there was
+        # rather than the least. An undeclared endpoint is now refused.
+        if not allowed:
+            return self._result(manifest, ExecutionStatus.DENIED, t0,
+                                error=("component declares no permissions.network; an http "
+                                       f"component must declare the hosts it contacts (wanted {host})"))
+        if host.lower() not in allowed:
             return self._result(manifest, ExecutionStatus.DENIED, t0,
                                 error=f"host {host} not declared in permissions.network {sorted(allowed)}")
         if graphql is not None:

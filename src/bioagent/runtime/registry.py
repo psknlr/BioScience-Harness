@@ -230,6 +230,7 @@ class Resolver:
         self._dataset_probe = dataset_probe or (lambda _cid: False)
         self._service_probe = service_probe or (lambda _sid: False)
         self._backend_probe = backend_probe or default_backend_probe
+        self._resolving: set[str] = set()
 
     # ------------------------------------------------------------ environment
     @staticmethod
@@ -262,6 +263,26 @@ class Resolver:
         if cid not in order:
             order.append(cid)
         return order
+
+    def _unusable_dependencies(self, m: ComponentManifest) -> list[tuple[str, str]]:
+        """Required components that are registered but cannot actually run.
+
+        Guarded against recursion: a dependency cycle is reported by
+        `dependency_order()`, and re-entering `resolve()` for a component already
+        on the stack would otherwise loop forever.
+        """
+        out: list[tuple[str, str]] = []
+        for dep_id in m.requires.components:
+            dep = self.registry.get(dep_id)
+            if dep is None or dep_id in self._resolving:
+                continue          # absent deps are already reported as missing
+            if dep.state is LifecycleState.QUARANTINED:
+                out.append((dep_id, dep.blocking_reason or "quarantined"))
+                continue
+            sub = self.resolve(dep_id)
+            if sub.state in (LifecycleState.UNAVAILABLE, LifecycleState.QUARANTINED):
+                out.append((dep_id, sub.reason or sub.state.value))
+        return out
 
     def _dependency_ids(self, m: ComponentManifest) -> list[str]:
         """Direct dependencies of a manifest: sub-components and the data it reads."""
@@ -352,6 +373,14 @@ class Resolver:
 
     # -------------------------------------------------------------- resolve
     def resolve(self, cid: str) -> Resolution:
+        """Resolve one component, following its required components recursively."""
+        self._resolving.add(cid)
+        try:
+            return self._resolve(cid)
+        finally:
+            self._resolving.discard(cid)
+
+    def _resolve(self, cid: str) -> Resolution:
         m = self.registry.get(cid)
         if m is None:
             return Resolution(cid, LifecycleState.UNAVAILABLE, reason="not in registry")
@@ -368,6 +397,11 @@ class Resolver:
         missing_bin = tuple(x for x in m.requires.binaries if not self.binary_available(x))
         missing_ds = tuple(x for x in m.requires.datasets if not self._dataset_probe(x))
         missing_comp = tuple(x for x in m.requires.components if x not in self.registry)
+        # Being *registered* is not being *usable*. Checking only membership let a
+        # parent report "dependencies satisfied" while a required component was
+        # itself UNAVAILABLE for a missing import — so a top-level workflow could
+        # look ready with a broken tool underneath it.
+        broken_deps = tuple(self._unusable_dependencies(m))
         missing_svc = tuple(x for x in m.requires.services if not self._service_probe(x))
 
         problems = []
@@ -386,6 +420,9 @@ class Resolver:
                             (f" — run: {fetch_cmd}" if fetchable else ""))
         if missing_comp:
             problems.append(f"missing components: {', '.join(missing_comp[:4])}")
+        if broken_deps:
+            problems.append("unusable dependencies: "
+                            + "; ".join(f"{cid} ({why})" for cid, why in broken_deps[:3]))
         if missing_svc:
             problems.append(f"missing services: {', '.join(missing_svc[:4])}")
         backend_ok, backend_reason = self._backend_probe(m.runtime.backend)

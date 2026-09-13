@@ -121,12 +121,20 @@ class Downloader:
             remote_size = src.stat().st_size
         else:
             remote_size = self._remote_size(url)
-            size_hint = expected_bytes or remote_size or 0
+            # The most pessimistic estimate wins. `expected_bytes or remote_size`
+            # took the manifest's declared size in preference to the server's, so
+            # a manifest claiming 10 MB waved through a 20 GB body, and with
+            # neither known the hint was 0 and the gate never applied at all.
+            size_hint = max(expected_bytes or 0, remote_size or 0)
             if size_hint > self.size_gate_bytes and not confirm:
                 raise DownloadError(
                     f"{name} is {size_hint / 1e9:.2f} GB, above the {self.size_gate_bytes / 1e9:.2f} GB "
                     "gate; call fetch(..., confirm=True) to proceed")
-            self._stream(url, part, remote_size)
+            # A server that reports no size cannot be gated up front, so the cap
+            # is also enforced mid-stream and the transfer aborts on the byte
+            # that crosses it.
+            self._stream(url, part, remote_size,
+                         max_bytes=None if confirm else self.size_gate_bytes)
 
         got_bytes = part.stat().st_size
         if expected_bytes is not None and got_bytes != expected_bytes:
@@ -151,7 +159,15 @@ class Downloader:
         self._record(res)
         return res
 
-    def _stream(self, url: str, part: Path, remote_size: int | None) -> None:
+    def _stream(self, url: str, part: Path, remote_size: int | None,
+                *, max_bytes: int | None = None) -> None:
+        """Fetch `url` into `part`, aborting if it grows past `max_bytes`.
+
+        The running cap is what makes the size gate real: a server that sends no
+        Content-Length gives nothing to check before the transfer starts, and
+        without it a 20 GB body downloaded in full and was rejected only
+        afterwards, having already spent the disk and the bandwidth.
+        """
         attempt = 0
         while True:
             attempt += 1
@@ -177,6 +193,13 @@ class Downloader:
                                 break
                             fh.write(block)
                             done += len(block)
+                            if max_bytes is not None and done > max_bytes:
+                                fh.close()
+                                part.unlink(missing_ok=True)
+                                raise DownloadError(
+                                    f"{part.name}: aborted after {done / 1e9:.2f} GB, above the "
+                                    f"{max_bytes / 1e9:.2f} GB gate; call fetch(..., confirm=True) "
+                                    "to proceed")
                             if remote_size and done % (32 << 20) < self.chunk:
                                 self._log(f"{part.name}: {done / 1e6:.0f}/{remote_size / 1e6:.0f} MB")
                 return

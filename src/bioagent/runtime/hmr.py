@@ -81,8 +81,13 @@ class HotReloader:
         # 3. dependencies — resolve the candidate in an isolated scratch registry
         scratch = ComponentRegistry([m for m in self.registry if m.id != cid])
         scratch.add(candidate)
+        # Carry the backend probe too. Dropping it silently reverted to
+        # `default_backend_probe`, which answers True for every backend except
+        # container/none — so a candidate could clear the dependency gate under
+        # environment assumptions the real runtime does not hold.
         scratch_resolver = Resolver(scratch, dataset_probe=self.resolver._dataset_probe,
-                                    service_probe=self.resolver._service_probe)
+                                    service_probe=self.resolver._service_probe,
+                                    backend_probe=self.resolver._backend_probe)
         res = scratch_resolver.resolve(cid)
         if res.state is LifecycleState.UNAVAILABLE:
             return fail("dependencies", res.reason)

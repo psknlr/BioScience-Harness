@@ -41,6 +41,16 @@ class Backend(abc.ABC):
     def handles(self, manifest: ComponentManifest) -> bool:
         return manifest.runtime.backend == self.backend
 
+    def rebind(self, loader: Any) -> "Backend":
+        """Return a backend that loads implementations through `loader`.
+
+        Only backends that import code need to override this. It exists so an
+        unregistered candidate can be executed against a scratch loader instead
+        of the production one — otherwise a candidate sharing the incumbent's id
+        is silently scored by running the incumbent.
+        """
+        return self
+
     # ------------------------------------------------------------------ helpers
     def _result(self, manifest: ComponentManifest, status: ExecutionStatus,
                 t0: float, value: Any = None, error: str | None = None,
@@ -66,6 +76,9 @@ class BackendRegistry:
 
     def get(self, name: str) -> Backend | None:
         return self._backends.get(name)
+
+    def all(self) -> tuple[Backend, ...]:
+        return tuple(self._backends.values())
 
     def for_component(self, manifest: ComponentManifest) -> Backend | None:
         return self._backends.get(manifest.runtime.backend)

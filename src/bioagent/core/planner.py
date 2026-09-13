@@ -39,11 +39,21 @@ class Plan:
 
 @dataclass
 class Critique:
-    """Verdict on an executed plan."""
+    """Judgement of an executed plan.
+
+    `accepted` decides whether the runtime stops retrying; `verdict` says
+    whether the science holds. Only a validator that compared against a metric,
+    threshold, benchmark or ground truth may set ACCEPTED — steps completing is
+    not a finding.
+    """
 
     accepted: bool
     reason: str
     retry_hint: str | None = None
+    #: None means "this critique did not judge the science"; the report then
+    #: falls back to deriving the verdict from `accepted`. The built-in planners
+    #: always set it explicitly, so their runs never claim an unearned ACCEPTED.
+    verdict: str | None = None
 
 
 class Planner(abc.ABC):
@@ -57,7 +67,7 @@ class Planner(abc.ABC):
         """Default critique: accept when every step succeeded."""
         failed = [r for r in results if not getattr(r, "ok", False)]
         if not results:
-            return Critique(False, "no steps were executed")
+            return Critique(False, "no steps were executed", verdict="REJECTED")
         if failed:
             names = ", ".join(getattr(r, "capability", "?") for r in failed[:3])
             return Critique(
@@ -65,7 +75,9 @@ class Planner(abc.ABC):
                 f"{len(failed)}/{len(results)} step(s) failed: {names}",
                 retry_hint="drop failing capabilities or select alternatives",
             )
-        return Critique(True, f"all {len(results)} step(s) succeeded")
+        return Critique(True, f"all {len(results)} step(s) succeeded; no validator "
+                              "judged the result, so the finding is not established",
+                        verdict="INCONCLUSIVE")
 
 
 class RetrievalPlanner(Planner):
