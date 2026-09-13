@@ -123,6 +123,42 @@ def test_every_package_directory_is_importable_from_the_installed_package() -> N
         importlib.import_module(dotted)
 
 
+def test_the_declared_version_is_stated_once() -> None:
+    """pyproject and __init__ drifted (0.2.2 vs 0.2.1).
+
+    The package version reaches provenance records and release artifacts, so two
+    answers means two different claims about which code produced a result.
+    """
+    import re
+
+    import bioagent
+
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+    assert declared, "pyproject.toml declares no version"
+    assert bioagent.__version__ == declared.group(1), (
+        f"__init__.py says {bioagent.__version__}, pyproject.toml says {declared.group(1)}")
+
+
+def test_required_packages_covers_every_shipped_package() -> None:
+    """The declared public-API list must not fall behind the tree.
+
+    The list is what lets the release gate notice a *missing* package; if a new
+    package is added and not declared, its disappearance would again go unseen.
+    """
+    from make_release import REQUIRED_PACKAGES
+
+    pkg_root = REPO / "src" / "bioagent"
+    on_disk = {
+        ".".join(("bioagent", *init.relative_to(pkg_root).parent.parts))
+        for init in pkg_root.rglob("__init__.py")
+        if "__pycache__" not in init.parts
+    }
+    undeclared = sorted(on_disk - set(REQUIRED_PACKAGES))
+    assert undeclared == [], (
+        f"packages not declared in make_release.REQUIRED_PACKAGES: {undeclared}")
+
+
 @pytest.mark.integration
 def test_the_built_wheel_contains_the_catalogue_and_no_sidecars(tmp_path) -> None:
     """The end-to-end check: build a real wheel and look inside it."""

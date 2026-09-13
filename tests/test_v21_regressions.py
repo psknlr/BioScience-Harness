@@ -151,10 +151,15 @@ def test_F_http_backend_exists_and_reports_status() -> None:
     from bioagent.backends.concrete import HTTPBackend
     from bioagent.status import ExecutionStatus
 
+    from bioagent.runtime.component import Permissions
+
     b = HTTPBackend(cache_dir=Path(tempfile.mkdtemp()))
     assert b.backend == "http" and b.available()
     m = mk("d.database.x", backend="http", entrypoint="", server="https://127.0.0.1:9/nope",
-           kind="database", mode="native")
+           kind="database", mode="native",
+           # An http component must declare the hosts it contacts; this used to
+           # be optional because an empty allowlist skipped the check.
+           permissions=Permissions(network=("127.0.0.1",)))
     res = b.invoke(m, path="/x")
     assert res.status in (ExecutionStatus.FAILED, ExecutionStatus.UNAVAILABLE,
                           ExecutionStatus.TIMEOUT)

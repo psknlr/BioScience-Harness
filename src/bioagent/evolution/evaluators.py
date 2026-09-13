@@ -38,25 +38,27 @@ def benchmark_components(rows: Iterable[dict], project: str = "BioMedArena",
 
 
 def _invoke_manifest(runtime: Any, manifest: ComponentManifest, spec: Any, **kwargs: Any):
-    """Invoke a manifest directly, whether or not it is registered.
+    """Score a manifest through the runtime's full invocation path.
 
-    A candidate under evaluation is deliberately NOT in the registry yet, so an
-    id-based lookup would score the incumbent instead. Scoring must act on the
-    manifest object it was handed.
+    This used to be a second, simplified execution chain
+    (`resolve_manifest -> backend.invoke`), and it was wrong in two ways that
+    both corrupted evolution results:
+
+    * it handed the manifest to a backend directly, and `PythonBackend` resolves
+      its entrypoint by *id* through the production loader — so a candidate
+      carrying the incumbent's id was scored by executing the **incumbent**;
+    * it accepted `spec` and never used it, so `PolicyKernel.authorize()` was
+      never consulted and a candidate that production would DENY still ran.
+
+    `Runtime.invoke_manifest()` closes both: it builds a scratch registry,
+    resolver, loader and backend set around this manifest, and then goes through
+    the ordinary resolve -> POLICY -> backend path. Keeping one execution chain
+    is the point — a second one drifts from production the moment either changes.
     """
-    from ..status import ExecutionStatus
-    from ..adapters.base import CallResult
+    from ..runtime.agentspec import AgentSpec
 
-    backend = runtime.backends.for_component(manifest)
-    if backend is None:
-        return CallResult(capability=manifest.id, adapter="none",
-                          status=ExecutionStatus.UNAVAILABLE,
-                          error=f"no backend for {manifest.runtime.backend!r}")
-    resolution = runtime.resolver.resolve_manifest(manifest)
-    if not resolution[0]:
-        return CallResult(capability=manifest.id, adapter="none",
-                          status=ExecutionStatus.UNAVAILABLE, error=resolution[1])
-    return backend.invoke(manifest, **kwargs)
+    return runtime.invoke_manifest(manifest, spec=spec or AgentSpec(name="evaluator"),
+                                   **kwargs)
 
 
 @dataclass

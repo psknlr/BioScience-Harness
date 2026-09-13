@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from .adapters.base import Adapter, CallResult
 from .core.executor import SandboxExecutor
 from .core.planner import Critique, Plan, Planner, RetrievalPlanner
+from .planners.base import merge_step_arguments
 from .core.provenance import ProvenanceLog
 from .policy import AuthorizationRequest, PolicyKernel
 from .status import ExecutionStatus, RunOutcome, ScientificVerdict
@@ -68,9 +69,16 @@ class RunReport:
 
     @property
     def verdict(self) -> str:
-        """Did the science hold? Taken from the critique, never from exit codes."""
+        """Did the science hold? Taken from the critique, never from exit codes.
+
+        A critique that only watched steps execute reports INCONCLUSIVE, so a run
+        cannot be `ok` until a validator has actually judged the result.
+        """
         if self.critique is None:
             return ScientificVerdict.INCONCLUSIVE.value
+        declared = getattr(self.critique, "verdict", None)
+        if declared in tuple(v.value for v in ScientificVerdict):
+            return declared
         return (ScientificVerdict.ACCEPTED.value if self.critique.accepted
                 else ScientificVerdict.REJECTED.value)
 
@@ -226,7 +234,7 @@ class BioAgent:
             plan = self.planner.plan(task, self.registry, max_steps=max_steps)
             plan.steps = [s for s in plan.steps if s.capability not in excluded]
             results = [self.invoke(step.capability, log=log, attempt=attempt,
-                                   **(step_kwargs or {}))
+                                   **merge_step_arguments(step, step_kwargs))
                        for step in plan.steps]
             every.extend(results)
             critique = self.planner.critique(plan, results)

@@ -36,6 +36,53 @@ PROJECT_IMPORT_ROOT = {
 }
 
 
+#: Directory names that hold a package but are not part of its import path.
+_NON_PACKAGE_DIRS = ("src", "lib", "python", "packages")
+
+
+def module_for_source(project: str, source_path: str) -> str:
+    """Derive an importable module path from a catalogue source path.
+
+    The previous derivation was `f"{root}.{Path(rel).stem}"`, which kept only the
+    filename and discarded every intermediate package, so
+    `Biomni/biomni/tool/tool_description/pharmacology.py` produced
+    `biomni.tool.pharmacology` — a module that does not exist. Across the bundled
+    catalogue the great majority of python-backed components disagreed with their
+    own `source_paths` this way, which is a large fraction of the python
+    capability surface, not an edge case.
+
+    The path is now used in full: strip the repository directory and any
+    non-package source root, then join what remains. `PROJECT_IMPORT_ROOT` acts
+    as an anchor — if the declared root already appears in the path the module
+    starts there, otherwise the root is prefixed onto the derived path.
+
+    This is still a derivation, and a derivation can be wrong when a project's
+    on-disk layout differs from its import layout. `scripts/entrypoint_census.py`
+    measures how many entrypoints actually import, so the error rate is reported
+    rather than assumed.
+    """
+    root = PROJECT_IMPORT_ROOT.get(project, slug(project))
+    rel = (source_path or "").split(";")[0].strip()
+    if not rel.endswith(".py"):
+        return root
+
+    parts = [p for p in Path(rel).with_suffix("").parts if p not in (".", "/")]
+    if parts and parts[0].lower() in (project.lower(), slug(project)):
+        parts = parts[1:]                       # drop the repository directory
+    while parts and parts[0].lower() in _NON_PACKAGE_DIRS:
+        parts = parts[1:]                       # drop src/ and friends
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts:
+        return root
+
+    anchor = root.split(".")[0]
+    lowered = [p.lower() for p in parts]
+    if anchor.lower() in lowered:
+        return ".".join(parts[lowered.index(anchor.lower()):])
+    return ".".join([root, *parts])
+
+
 def infer_backend(kind: str, integration_mode: str, native_connectors: Iterable[str],
                   project: str) -> str:
     """Choose an execution backend from catalogue facts."""
@@ -141,13 +188,7 @@ class CatalogueProvider:
         entrypoint = ""
         server = ""
         if backend == "python":
-            root = PROJECT_IMPORT_ROOT.get(primary, slug(primary))
-            module = root
-            if rel.endswith(".py"):
-                stem = Path(rel).stem
-                if stem and stem not in ("__init__",):
-                    module = f"{root}.{stem}" if not root.endswith(stem) else root
-            entrypoint = f"{module}:{name}"
+            entrypoint = f"{module_for_source(primary, rel)}:{name}"
         elif backend == "mcp":
             server = ncs[0] if ncs else ""
             entrypoint = name

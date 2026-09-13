@@ -1,4 +1,92 @@
-# bioagent-harness v2.2 — a composable harness for biomedical AI agents
+# bioagent-harness v2.3 — a composable harness for biomedical AI agents
+
+## v2.3 — execution semantics
+
+v2.2 hardened the declarative layer. This release makes the execution layer
+honour it: in several places a manifest or a planner said what should happen and
+the backend did something else, or something else's work was scored as if it
+were this component's. Pinned by `tests/test_v23_execution_semantics.py`.
+
+**The planner's decisions now reach the backend**
+- `PlanStep.arguments` had no consumer anywhere in the codebase. A planner could
+  decide to call `/lookup/id/ENSG…` with specific parameters and the runtime
+  invoked the component with nothing at all. Step arguments now flow through both
+  `Runtime.run` and the legacy `BioAgent.run`, taking precedence over run-wide
+  defaults.
+
+**Self-evolution was scoring the wrong thing**
+- *Candidates were evaluated by running the incumbent.* `PythonBackend` resolves
+  entrypoints by `manifest.id` through the production loader, and a candidate
+  normally carries the incumbent's id — so "the candidate improved" was the old
+  version compared against itself. `Runtime.invoke_manifest()` now builds a
+  scratch registry, resolver, loader and rebound backends so the only reachable
+  implementation is the candidate's.
+- *Benchmarking bypassed the policy kernel.* The evaluator had its own
+  simplified chain (`resolve_manifest -> backend.invoke`) that never called
+  `authorize()`, so a candidate production would DENY still executed. There is
+  now one execution path.
+- *Only the first declared benchmark ran.* A candidate that improved
+  `benchmarks[0]` was promoted while a declared safety benchmark it broke was
+  never executed. Every benchmark runs; any regression beyond
+  `regression_tolerance` blocks promotion; and a component with no incumbent must
+  clear `min_absolute_score` instead of skipping the gate entirely.
+
+**Resolution reflects reality**
+- A required component being *registered* was treated as it being *usable*, so a
+  parent reported "dependencies satisfied" over a dependency that was itself
+  UNAVAILABLE. Resolution now recurses, with a re-entrancy guard for cycles.
+- `Runtime` built its Resolver with no `dataset_probe`, so the fallback
+  `lambda _cid: False` made every dataset component permanently UNAVAILABLE even
+  with the file in the lake — and dead-ended `auto_fetch`, whose re-resolution
+  after a successful download consulted the same always-False probe. The runtime
+  now wires its `DatasetBackend` in.
+- Hot reload's scratch resolver dropped the `backend_probe`, silently reverting
+  to the permissive default, so a candidate could clear the dependency gate under
+  environment assumptions the real runtime does not hold.
+
+**Entrypoints match their sources**
+- Module paths were derived as `f"{root}.{Path(rel).stem}"`, discarding every
+  intermediate package: `biomni/tool/tool_description/pharmacology.py` became
+  `biomni.tool.pharmacology`. Measured independently of the deriver, **697 of 817**
+  python-backed components disagreed with their own `source_paths`; it is now 0.
+  `scripts/entrypoint_census.py` reports CONSISTENT / IMPORTABLE / CALLABLE so the
+  error rate is measured rather than assumed.
+
+**Deny by default**
+- An http component declaring no `permissions.network` skipped the host check
+  entirely, making an empty allowlist the most permissive setting rather than the
+  least. Undeclared endpoints are refused.
+- The download size gate took the manifest's declared size in preference to the
+  server's (`expected_bytes or remote_size`), so a manifest claiming 10 MB waved
+  through a 20 GB body; with neither known the hint was 0 and the gate never
+  applied. It now takes the largest estimate and also enforces the cap
+  mid-stream, aborting on the byte that crosses it.
+
+**Honest reporting**
+- *Execution success is not a scientific finding.* The default critique reported
+  ACCEPTED for "all steps succeeded", which the runtime turned into
+  `ScientificVerdict.ACCEPTED`. A statistical test can run cleanly and return
+  p = 0.83. Planners that only watch steps execute now report INCONCLUSIVE, and
+  only a validator comparing against a metric, threshold, benchmark or ground
+  truth may set ACCEPTED.
+- `ContainerBackend` ran `<rt> run --rm --network none <image>`, ignoring the
+  entrypoint and every argument, then reported SUCCEEDED *for that component* and
+  advanced it to READY — so every component sharing an image behaved identically.
+  It now requires an entrypoint and passes the invocation through.
+- `SubprocessBackend` required a `code=` argument no planner path supplies. It
+  builds the call from the manifest's `module:function` entrypoint instead.
+- `DataLakeAdapter._load_json` called `json.load()` on the whole file before
+  slicing to `nrows`, so a bounded read of an 8 GB file parsed 8 GB. JSON Lines is
+  detected and streamed; an oversized single document is refused with the reason,
+  because a JSON document genuinely cannot be sliced without being parsed.
+
+**Release gate**
+- `--check` was a junk sweep plus a syntax parse, and both pass on a tree missing
+  an entire package — a deleted package has no files to fail. It printed OK while
+  `bioagent.workspace` did not exist. The gate now imports a **declared** list of
+  public packages (a discovered list cannot detect absence) and compares the tree
+  against `git ls-files`.
+- `pyproject.toml` and `__init__.py` disagreed on the version (0.2.2 vs 0.2.1).
 
 ## v2.2 — trusted-core hardening
 
@@ -131,6 +219,15 @@ Nine v1 defects were reproduced empirically and fixed; each has a regression tes
     tests/test_v22_trusted_core.py   profile bypass, filesystem capabilities, lineage
                                      propagation, execution-vs-verdict, backend probing
     tests/test_packaging.py          release hygiene: sidecars, parseability, wheel contents
+    tests/test_v23_execution_semantics.py
+                                     step arguments, candidate isolation, dependency
+                                     propagation, dataset probing, deny-by-default,
+                                     promotion gates, verdict honesty
+
+Measuring the catalogue's python entrypoints:
+
+    python scripts/entrypoint_census.py --no-imports   # consistency with source_paths
+    python scripts/entrypoint_census.py                # + importable / callable here
 
 Building a release, with the checks that refuse a broken one:
 

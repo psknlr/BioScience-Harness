@@ -26,7 +26,7 @@ class DataLakeAdapter(Adapter):
     requires_network = False
 
     #: extensions this adapter knows how to load
-    LOADABLE = {".parquet", ".csv", ".tsv", ".txt", ".json"}
+    LOADABLE = {".parquet", ".csv", ".tsv", ".txt", ".json", ".jsonl", ".ndjson"}
 
     def __init__(self, lake_dir: str | Path) -> None:
         self.lake_dir = Path(lake_dir)
@@ -77,7 +77,7 @@ class DataLakeAdapter(Adapter):
                                   status=ExecutionStatus.DEGRADED, value=value,
                                   duration_s=time.perf_counter() - t0)
 
-            if suffix == ".json":
+            if suffix in (".json", ".jsonl", ".ndjson"):
                 value = self._load_json(path, nrows)
             elif suffix == ".parquet":
                 value = self._load_parquet(path, nrows, columns)
@@ -100,9 +100,59 @@ class DataLakeAdapter(Adapter):
                               duration_s=time.perf_counter() - t0)
 
     # ------------------------------------------------------------- loaders
-    @staticmethod
-    def _load_json(path: Path, nrows: int | None) -> dict:
-        """Parse JSON as JSON. Records-shaped payloads become a table preview."""
+    #: Files above this are not parsed whole; JSON Lines streams instead and a
+    #: single large JSON document is refused rather than silently loaded.
+    JSON_WHOLE_FILE_LIMIT = 256 * 1024 * 1024
+
+    @classmethod
+    def _load_jsonl(cls, path: Path, nrows: int | None) -> dict:
+        """Read the first `nrows` records of a JSON Lines file, and no more."""
+        head: list = []
+        want = nrows if nrows else None
+        n_scanned = 0
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                n_scanned += 1
+                try:
+                    head.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+                if want is not None and len(head) >= want:
+                    break
+        cols: list[str] = []
+        for r in head:
+            if isinstance(r, dict):
+                cols += [c for c in r if c not in cols]
+        return {"parsed_as": "jsonl", "shape": [len(head), len(cols)],
+                "columns": cols[:40], "head": head[:3],
+                "n_records_total": None, "streamed": True,
+                "note": "JSON Lines read incrementally; total record count not scanned"}
+
+    @classmethod
+    def _load_json(cls, path: Path, nrows: int | None) -> dict:
+        """Parse JSON as JSON. Records-shaped payloads become a table preview.
+
+        `nrows` bounds what is *returned*; for a single JSON document it cannot
+        bound what is *read*, because the value is only well-formed once the
+        whole text is parsed. Calling `json.load()` unconditionally therefore
+        contradicted the bounded-slice contract — `nrows=5` against an 8 GB file
+        parsed all 8 GB into memory and then sliced. JSON Lines streams properly
+        and is used whenever the file is one; an oversized single document is
+        refused with the reason instead.
+        """
+        if path.suffix.lower() in (".jsonl", ".ndjson") or cls._looks_like_jsonl(path):
+            return cls._load_jsonl(path, nrows)
+        size = path.stat().st_size
+        if size > cls.JSON_WHOLE_FILE_LIMIT:
+            return {"parsed_as": "json", "shape": [0, 0], "columns": [], "head": [],
+                    "bytes": size, "streamed": False,
+                    "note": (f"single JSON document of {size / 1e9:.2f} GB exceeds the "
+                             f"{cls.JSON_WHOLE_FILE_LIMIT / 1e9:.2f} GB whole-file parse limit; "
+                             "a JSON document cannot be sliced without being parsed in full — "
+                             "convert to JSON Lines or Parquet for bounded reads")}
         with open(path, encoding="utf-8", errors="replace") as fh:
             obj = json.load(fh)
         records = None
@@ -124,6 +174,25 @@ class DataLakeAdapter(Adapter):
         keys = list(obj)[:40] if isinstance(obj, dict) else []
         return {"parsed_as": "json", "shape": [1, len(keys)], "columns": keys,
                 "head": [{k: obj[k] for k in keys[:5]}] if keys else [obj]}
+
+    @staticmethod
+    def _looks_like_jsonl(path: Path, probe_bytes: int = 65536) -> bool:
+        """Detect JSON Lines from the first line without reading the file."""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                first = fh.readline(probe_bytes).strip()
+                if not first.startswith("{") or not first.endswith("}"):
+                    return False
+                second = fh.readline(probe_bytes).strip()
+        except OSError:
+            return False
+        if not second:
+            return False
+        try:
+            json.loads(first)
+        except json.JSONDecodeError:
+            return False
+        return second.startswith("{")
 
     @staticmethod
     def _load_parquet(path: Path, nrows: int | None, columns: list[str] | None) -> dict:
