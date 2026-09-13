@@ -84,6 +84,45 @@ def test_package_data_declares_every_runtime_data_file() -> None:
             "it would be dropped from the wheel")
 
 
+def test_every_source_file_is_tracked_by_git() -> None:
+    """A .gitignore pattern must never silently drop a package from the commit.
+
+    An unanchored `workspace/` rule also matched `src/bioagent/workspace/`, so
+    that package was excluded from a commit while the working tree still had the
+    files: the local suite passed and CI failed on ModuleNotFoundError. Only a
+    check against what git actually tracks can see this.
+    """
+    if not (REPO / ".git").exists():
+        pytest.skip("not a git checkout")
+    tracked = subprocess.run(["git", "ls-files", "src", "tests", "scripts"],
+                             cwd=REPO, capture_output=True, text=True)
+    if tracked.returncode != 0:
+        pytest.skip(f"git unavailable: {tracked.stderr.strip()}")
+    known = {line.strip() for line in tracked.stdout.splitlines() if line.strip()}
+    on_disk = {
+        str(path.relative_to(REPO))
+        for base in ("src", "tests", "scripts")
+        for path in (REPO / base).rglob("*.py")
+        if "__pycache__" not in path.parts and not path.name.startswith("._")
+    }
+    missing = sorted(on_disk - known)
+    assert missing == [], (
+        f"{len(missing)} source file(s) exist but are not tracked by git — a "
+        f".gitignore pattern is probably matching them: {missing[:8]}")
+
+
+def test_every_package_directory_is_importable_from_the_installed_package() -> None:
+    """Every `src/bioagent/**/__init__.py` must import from the install."""
+    import importlib
+
+    pkg_root = REPO / "src" / "bioagent"
+    for init in sorted(pkg_root.rglob("__init__.py")):
+        if "__pycache__" in init.parts:
+            continue
+        dotted = ".".join(("bioagent", *init.relative_to(pkg_root).parent.parts))
+        importlib.import_module(dotted)
+
+
 @pytest.mark.integration
 def test_the_built_wheel_contains_the_catalogue_and_no_sidecars(tmp_path) -> None:
     """The end-to-end check: build a real wheel and look inside it."""
