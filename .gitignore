@@ -1,0 +1,17 @@
+.cache/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+workspace/
+
+# macOS AppleDouble sidecars. These are not cosmetic: `._test_foo.py` is a
+# filename pytest collects, and ~80 of them shipped inside the v2.1 release
+# tarball, breaking collection for anyone who unpacked it.
+._*
+.DS_Store
+__MACOSX/
+demo_out/
