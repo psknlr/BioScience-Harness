@@ -1,12 +1,15 @@
 .cache/
 __pycache__/
 *.py[cod]
-build/
-dist/
+/build/
+/dist/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
-workspace/
+# Anchored. Unanchored `workspace/` also matches src/bioagent/workspace/, which
+# silently dropped that package from a commit: the tree still had the files, so
+# the local suite passed and CI failed on ModuleNotFoundError.
+/workspace/
 
 # macOS AppleDouble sidecars. These are not cosmetic: `._test_foo.py` is a
 # filename pytest collects, and ~80 of them shipped inside the v2.1 release
@@ -14,4 +17,4 @@ workspace/
 ._*
 .DS_Store
 __MACOSX/
-demo_out/
+/demo_out/
