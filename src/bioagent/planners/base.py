@@ -28,9 +28,53 @@ class Plan:
     steps: list[PlanStep] = field(default_factory=list)
     planner: str = ""
     notes: str = ""
+    #: Non-empty when the plan was NOT produced by the planner the spec asked
+    #: for. `AgentSpec(planner="llm")` used to fall back to heuristic ordering
+    #: silently; the runtime now records this in the event log and the report.
+    degraded: str = ""
 
     def __len__(self) -> int:
         return len(self.steps)
+
+
+@dataclass(frozen=True)
+class PlanContext:
+    """What a planner should know about the attempts before this one.
+
+    Retrying used to mean "plan again from nothing and delete the failed steps
+    afterwards": the planner never saw the error, the critique's retry hint, or
+    the ids to avoid, and because exclusion happened *after* top-k selection a
+    plan of five could only ever shrink toward zero instead of reaching for the
+    sixth candidate.
+    """
+
+    attempt: int = 1
+    excluded: frozenset[str] = frozenset()
+    #: {"component_id", "status", "error"} for each step that did not succeed
+    failures: tuple[dict, ...] = ()
+    retry_hint: str | None = None
+    previous_critique: str | None = None
+    #: retrieved memory snippets a planner may condition on
+    memory: tuple[str, ...] = ()
+
+    def describe(self) -> str:
+        """Human/model-readable feedback block; empty on the first attempt."""
+        if self.attempt <= 1 and not self.failures and not self.memory:
+            return ""
+        lines = [f"ATTEMPT {self.attempt}."]
+        if self.previous_critique:
+            lines.append(f"Previous critique: {self.previous_critique}")
+        if self.retry_hint:
+            lines.append(f"Retry hint: {self.retry_hint}")
+        for f in self.failures[:6]:
+            lines.append(f"- {f.get('component_id')} -> {f.get('status')}: "
+                         f"{str(f.get('error') or '')[:160]}")
+        if self.excluded:
+            lines.append("Do not use: " + ", ".join(sorted(self.excluded)[:12]))
+        if self.memory:
+            lines.append("Relevant memory:")
+            lines += [f"  * {m[:200]}" for m in self.memory[:5]]
+        return "\n".join(lines)
 
 
 @dataclass
@@ -61,8 +105,9 @@ class PlannerPlugin(abc.ABC):
     name: str = "planner"
 
     @abc.abstractmethod
-    def plan(self, task: str, registry: Any, *, max_steps: int = 5) -> Plan:
-        ...
+    def plan(self, task: str, registry: Any, *, max_steps: int = 5,
+             context: PlanContext | None = None) -> Plan:
+        """Turn a task into a plan. `context` carries feedback from prior attempts."""
 
     def critique(self, plan: Plan, results: Sequence[Any]) -> Critique:
         """Default: accept only if something executed and nothing failed."""
@@ -104,6 +149,25 @@ def merge_step_arguments(step: Any, step_kwargs: dict | None) -> dict:
     merged = dict(step_kwargs or {})
     merged.update(getattr(step, "arguments", None) or {})
     return merged
+
+
+def plan_with_context(planner: PlannerPlugin, task: str, registry: Any, *,
+                      max_steps: int, context: PlanContext | None) -> Plan:
+    """Call `plan()` with the context if the planner accepts one.
+
+    Third-party planners written against the older two-argument signature keep
+    working; they simply do not see the feedback.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(planner.plan).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "context" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                  for p in params.values()):
+        return planner.plan(task, registry, max_steps=max_steps, context=context)
+    return planner.plan(task, registry, max_steps=max_steps)
 
 
 PLANNER_REGISTRY: dict[str, type[PlannerPlugin]] = {}

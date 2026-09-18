@@ -21,6 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 from bioagent.backends.base import BackendRegistry
+from bioagent.backends.agent import AgentBackend, RemoteAgentBackend
 from bioagent.backends.concrete import (ContainerBackend, DatasetBackend, MCPBackend,
                                         NoneBackend, PythonBackend, SubprocessBackend)
 from bioagent.config import REPO_ROOT, catalogue_path, data_lake_dir
@@ -62,6 +63,7 @@ def build_runtime() -> tuple[Runtime, ComponentRegistry, AgentSpec, Resolver, Lo
     backends = BackendRegistry([
         PythonBackend(loader), MCPBackend(), DatasetBackend(lake),
         SubprocessBackend(), ContainerBackend(), NoneBackend(),
+        AgentBackend(), RemoteAgentBackend(),
     ])
     rt = Runtime(reg, backends, kernel=PolicyKernel(), resolver=resolver, loader=loader,
                  catalogue_version="unified-v2")

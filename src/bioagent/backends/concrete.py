@@ -163,6 +163,12 @@ class SubprocessBackend(Backend):
     def _code_for(manifest: ComponentManifest, arguments: dict) -> str:
         return _SubprocessCodeBuilder.build(manifest, arguments)
 
+    @staticmethod
+    def _path_prelude(root: Path) -> str:
+        """Make the upstream checkout importable inside an isolated interpreter."""
+        return (f"import sys as _sys; _sys.path.insert(0, {str(root)!r}); "
+                "del _sys\n")
+
     def invoke(self, manifest: ComponentManifest, *, code: str | None = None,
                **kwargs: Any) -> Any:
         t0 = time.perf_counter()
@@ -184,6 +190,13 @@ class SubprocessBackend(Backend):
                     error=("no invocation code supplied and the manifest declares no "
                            "'module:function' entrypoint to build one from"))
             kwargs = {}
+        # `-I` (isolated mode) is kept for what it is for — no user site, no
+        # PYTHONPATH, no environment leakage — but it also drops the working
+        # directory from sys.path, so `cwd=<upstream root>` alone never made the
+        # upstream package importable: `import demo_pkg` from an un-installed
+        # checkout failed with ModuleNotFoundError. The root is put on the path
+        # explicitly, which is the one thing "invoke in place" actually needs.
+        code = self._path_prelude(root) + code
         try:
             proc = subprocess.run(  # noqa: S603
                 [sys.executable, "-I", "-c", code], cwd=str(root),
@@ -217,7 +230,10 @@ class _SubprocessCodeBuilder:
             "import json, sys\n"
             f"import {module} as _m\n"
             f"_fn = getattr(_m, {func!r})\n"
-            f"_args = json.loads({json.dumps(json.dumps(arguments, default=str))!r})\n"
+            # One encoding, not two: the previous form json-encoded the encoded
+            # string again, so the child decoded a *string* and `_fn(**_args)`
+            # raised TypeError before the entrypoint ran.
+            f"_args = json.loads({json.dumps(arguments, default=str)!r})\n"
             "_out = _fn(**_args)\n"
             "try:\n"
             "    sys.stdout.write(json.dumps(_out, default=str))\n"
@@ -246,11 +262,12 @@ class ContainerBackend(Backend):
 
     def invoke(self, manifest: ComponentManifest, **kwargs: Any) -> Any:
         t0 = time.perf_counter()
-        if not self.available():
-            return self._result(manifest, ExecutionStatus.UNAVAILABLE, t0,
-                                error=self.unavailable_reason())
         image = manifest.runtime.image
         entrypoint = (manifest.runtime.entrypoint or "").strip()
+        # A manifest defect is reported before an environment one: the missing
+        # entrypoint is true on every machine, the missing runtime only on this
+        # one, and reporting the environment first hid the defect on machines
+        # without Docker — where this backend's own regression test then failed.
         if not entrypoint:
             # Running the image's default command executes whatever the image
             # does, not what this component declares. Reporting that as this
@@ -262,6 +279,9 @@ class ContainerBackend(Backend):
                 error=("component declares no runtime.entrypoint, so the container would run "
                        f"the default command of {image!r} rather than this component; declare "
                        "an entrypoint to make the invocation specific"))
+        if not self.available():
+            return self._result(manifest, ExecutionStatus.UNAVAILABLE, t0,
+                                error=self.unavailable_reason())
         timeout_s = kwargs.pop("timeout_s", 300)
         payload = json.dumps({"entrypoint": entrypoint, "arguments": kwargs}, default=str)
         cmd = [self.runtime_bin, "run", "--rm", "--network", "none",

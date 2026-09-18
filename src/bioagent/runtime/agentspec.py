@@ -12,12 +12,12 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..adapters.base import CallResult
 from ..backends.base import BackendRegistry
-from ..planners.base import (Critique, Plan, PlannerPlugin, get_planner,
-                             merge_step_arguments)
+from ..planners.base import (Critique, Plan, PlanContext, PlannerPlugin, get_planner,
+                             merge_step_arguments, plan_with_context)
 from ..policy import AuthorizationRequest, PolicyKernel
 from ..status import ExecutionStatus, LifecycleState, RunOutcome, ScientificVerdict
 from .component import ComponentManifest
@@ -41,6 +41,13 @@ class AgentSpec:
     #: allow Runtime.invoke to download a FETCHABLE dataset on first use
     auto_fetch: bool = False
     auto_fetch_max_bytes: int = 256 * 1024 * 1024
+    #: model identifier handed to model-backed planners, agents and synthesis;
+    #: the client itself is bound on the Runtime (it is code, not data)
+    model: str = ""
+    #: refuse to run rather than fall back to heuristic planning without a model
+    require_model: bool = False
+    #: integrate step results into a final answer with provenance
+    synthesize: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,6 +75,8 @@ class RunReport:
     critique: Critique | None = None
     events: EventLog | None = None
     attempts: int = 1
+    #: the integrated answer, when `AgentSpec.synthesize` is on
+    synthesis: Any = None
 
     @property
     def execution_outcome(self) -> str:
@@ -128,6 +137,8 @@ class RunReport:
             "attempts": self.attempts,
             "statuses": {r.capability: r.status.value for r in self.results},
             "n_events": len(self.events) if self.events else 0,
+            "planner_degraded": self.plan.degraded or None,
+            "answer": (self.synthesis.answer[:300] if self.synthesis is not None else None),
         }
 
 
@@ -141,11 +152,20 @@ class Runtime:
     def __init__(self, registry: ComponentRegistry, backends: BackendRegistry,
                  kernel: PolicyKernel | None = None, resolver: Resolver | None = None,
                  loader: Loader | None = None, catalogue_version: str = "unknown",
-                 git_commit: str = "", downloader: Any = None) -> None:
+                 git_commit: str = "", downloader: Any = None,
+                 llm_client: Callable[[str], str] | None = None,
+                 memory: Any = None) -> None:
         self.downloader = downloader
         self.registry = registry
         self.backends = backends
         self.kernel = kernel or PolicyKernel()
+        #: The one model client every model-backed part of a run shares:
+        #: planner, agent-role components, synthesis. `AgentSpec.model` names
+        #: the model; the callable lives here because a spec is data.
+        self.llm_client = llm_client
+        #: optional `runtime.memory.EpisodicMemory`; runs record to it and
+        #: planners/agents retrieve from it
+        self.memory = memory
         # A resolver we build ourselves asks *this runtime's* backends whether a
         # mechanism can run, rather than assuming (the resolver used to declare
         # every container component unavailable regardless of the machine).
@@ -154,6 +174,12 @@ class Runtime:
         self.loader = loader or Loader(registry, self.resolver)
         self.catalogue_version = catalogue_version
         self.git_commit = git_commit
+        # Backends that execute *through* the runtime (agent roles calling tools)
+        # need a reference back to it.
+        for b in self.backends.all():
+            bind = getattr(b, "bind_runtime", None)
+            if callable(bind):
+                bind(self)
 
     def _dataset_probe(self, name: str) -> bool:
         """Is this dataset present for a backend that could actually read it?
@@ -271,6 +297,11 @@ class Runtime:
                              status=ExecutionStatus.UNAVAILABLE,
                              error=f"no backend registered for {m.runtime.backend!r}")
         else:
+            if getattr(backend, "wants_runtime_context", False):
+                # Backends that execute *through* the runtime (agent roles
+                # calling tools) need the spec for policy and the event log
+                # for provenance of the calls they make.
+                kwargs = {**kwargs, "spec": spec, "events": events, "parent_event": ev_policy}
             res = backend.invoke(m, **kwargs)
             res.authorization = auth
             # A successful invocation is the only proof of READY. Advance the
@@ -339,16 +370,31 @@ class Runtime:
         root = events.emit(EventType.TASK_CREATED, inputs={"task": task},
                            detail={"agent": spec.name, "planner": spec.planner}).event_id
         pl = planner or self._planner_for(spec)
+        if spec.require_model and self.llm_client is None:
+            raise RuntimeError(
+                f"agent {spec.name!r} requires a model (require_model=True) but no "
+                "llm_client is bound to the runtime; bind one or drop require_model")
+
         excluded: set[str] = set()
+        failures: list[dict] = []
+        previous: Critique | None = None
         every: list[CallResult] = []
         report: RunReport | None = None
         for attempt in range(1, spec.max_attempts + 1):
-            plan = pl.plan(task, self.registry, max_steps=spec.max_steps)
+            context = PlanContext(
+                attempt=attempt, excluded=frozenset(excluded), failures=tuple(failures),
+                retry_hint=(previous.retry_hint if previous else None),
+                previous_critique=(previous.reason if previous else None),
+                memory=tuple(self._recall(task)))
+            plan = plan_with_context(pl, task, self.registry, max_steps=spec.max_steps,
+                                     context=context)
+            # Safety net only: planners that honour the context already excluded these.
             plan.steps = [s for s in plan.steps if s.component_id not in excluded]
-            results = [self.invoke(s.component_id, spec=spec, events=events,
-                                   parent_event=root, attempt=attempt,
-                                   **merge_step_arguments(s, step_kwargs))
-                       for s in plan.steps]
+            if plan.degraded:
+                events.emit(EventType.PLANNER_FALLBACK, parent=root, status="DEGRADED",
+                            detail={"requested": spec.planner, "used": plan.planner,
+                                    "reason": plan.degraded, "attempt": attempt})
+            results = self._execute_plan(plan, spec, events, root, attempt, step_kwargs)
             every.extend(results)
             crit = pl.critique(plan, results)
             report = RunReport(task=task, spec=spec, plan=plan, results=results,
@@ -356,18 +402,113 @@ class Runtime:
                                attempts=attempt)
             if crit.accepted or not plan.steps:
                 break
-            excluded.update(r.capability for r in results if not r.status.successful)
+            previous = crit
+            failures = [{"component_id": r.capability, "status": r.status.value,
+                         "error": r.error} for r in results if not r.status.successful]
+            # Exclude only components that failed on their own account. A step
+            # that never ran because its input reference could not be resolved
+            # (adapter "dataflow") is not a broken component — excluding it
+            # would punish the consumer for the producer's failure and shrink
+            # the next plan for no reason. The planner still sees it as a
+            # failure in the feedback.
+            excluded.update(r.capability for r in results
+                            if not r.status.successful and r.adapter != "dataflow")
         assert report is not None
+
+        if spec.synthesize:
+            from .synthesis import EvidenceSynthesizer
+
+            synth = EvidenceSynthesizer(self.llm_client, model=spec.model)
+            report.synthesis = synth.synthesize(task, report.results)
+            events.emit(EventType.SYNTHESIS_COMPLETED, parent=root,
+                        status=report.synthesis.method.upper(), model=spec.model,
+                        output=report.synthesis.to_dict(),
+                        detail={"n_findings": len(report.synthesis.findings),
+                                "n_conflicts": len(report.synthesis.conflicts),
+                                "verdict": report.synthesis.verdict})
+        self._remember(task, report, events, root)
         events.emit(EventType.RUN_COMPLETED, parent=root, status=report.execution_outcome,
                     detail={**report.summary(), "scientific_verdict": report.verdict})
         return report
 
-    def _planner_for(self, spec: AgentSpec) -> PlannerPlugin:
-        """Instantiate the spec's planner, handing it backend awareness when accepted."""
+    def _execute_plan(self, plan: Plan, spec: AgentSpec, events: EventLog, root: str,
+                      attempt: int, step_kwargs: dict | None) -> list[CallResult]:
+        """Run the steps in order, binding each step's references to earlier outputs.
+
+        Steps used to be independent invocations, so step 2 could not consume
+        step 1's output. Now `${steps.<id>.output.<path>}` in a step's arguments
+        resolves against the results so far; a reference that cannot be resolved
+        fails *that step* with the reason instead of calling the backend with a
+        literal template string.
+        """
+        from .dataflow import DataflowError, bind_arguments
+
+        results: list[CallResult] = []
+        by_step: dict[str, CallResult] = {}
+        for idx, s in enumerate(plan.steps):
+            try:
+                bound = bind_arguments(merge_step_arguments(s, step_kwargs), by_step,
+                                       task=plan.task)
+            except DataflowError as exc:
+                # CANCELLED, not FAILED: the step never ran. FAILED would count
+                # as executed in the outcome and imply the backend was reached.
+                res = CallResult(capability=s.component_id, adapter="dataflow",
+                                 status=ExecutionStatus.CANCELLED,
+                                 error=f"unresolved input: {exc}")
+                events.emit(EventType.DATAFLOW_FAILED, parent=root, component_id=s.component_id,
+                            status=res.status.value, inputs=dict(s.arguments),
+                            detail={"attempt": attempt, "error": str(exc)})
+            else:
+                res = self.invoke(s.component_id, spec=spec, events=events,
+                                  parent_event=root, attempt=attempt, **bound)
+            results.append(res)
+            by_step[s.component_id] = res
+            by_step[str(idx)] = res
+        return results
+
+    # ------------------------------------------------------------------ memory
+    def _recall(self, task: str, k: int = 5) -> list[str]:
+        if self.memory is None:
+            return []
         try:
-            return get_planner(spec.planner, backends=self.backends)
-        except TypeError:
-            return get_planner(spec.planner)
+            return [e.text for e in self.memory.search(task, k=k)]
+        except Exception:  # noqa: BLE001 - memory must never break a run
+            return []
+
+    def _remember(self, task: str, report: RunReport, events: EventLog, root: str) -> None:
+        if self.memory is None:
+            return
+        try:
+            entry = self.memory.remember_run(task, report)
+            events.emit(EventType.MEMORY_WRITTEN, parent=root, status="WRITTEN",
+                        detail={"entry_id": entry.entry_id, "kind": entry.kind})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _planner_for(self, spec: AgentSpec) -> PlannerPlugin:
+        """Instantiate the spec's planner with whatever wiring it accepts.
+
+        The previous try/except-TypeError dance meant a planner that did not
+        take `backends=` was constructed with *no* arguments at all — so
+        `AgentSpec(planner="llm")` produced an `LLMPlanner(client=None)` that
+        quietly planned heuristically. The constructor is now inspected and
+        given exactly the wiring it declares: backends, the runtime's model
+        client, and the spec's model name.
+        """
+        import inspect
+
+        from ..planners.base import PLANNER_REGISTRY
+
+        if spec.planner not in PLANNER_REGISTRY:
+            return get_planner(spec.planner)          # raises the standard KeyError
+        cls = PLANNER_REGISTRY[spec.planner]
+        try:
+            params = inspect.signature(cls.__init__).parameters
+        except (TypeError, ValueError):
+            params = {}
+        offered = {"backends": self.backends, "client": self.llm_client, "model": spec.model}
+        kwargs = {k: v for k, v in offered.items() if k in params}
+        return cls(**kwargs)
 
     def fetch(self, m: ComponentManifest, *, max_bytes: int | None = None, confirm: bool = False,
               events: EventLog | None = None, parent_event: str | None = None,

@@ -83,6 +83,32 @@ def module_for_source(project: str, source_path: str) -> str:
     return ".".join([root, *parts])
 
 
+def http_server_for(hosts: Iterable[str]) -> str:
+    """Base URL for an http component, from the hosts it declares.
+
+    The catalogue records the hosts a database component contacts but not its
+    API base, so http manifests shipped with `server=""` and failed only at
+    invocation. Where the host is one of the typed public sources, that source's
+    real base URL is used; otherwise the host root is the base and the caller
+    supplies the path. A component declaring no host at all gets no server and
+    fails validation, which is the truthful outcome.
+    """
+    from .public_apis import SOURCES
+
+    by_host = {s.host: s.base_url for s in SOURCES}
+    for h in hosts:
+        h = str(h).strip().lower().rstrip(".")
+        if not h or h == "..." or "/" in h:
+            continue
+        if h in by_host:
+            return by_host[h]
+        for known, base in by_host.items():
+            if h.endswith("." + known):
+                return base
+        return f"https://{h}"
+    return ""
+
+
 def infer_backend(kind: str, integration_mode: str, native_connectors: Iterable[str],
                   project: str) -> str:
     """Choose an execution backend from catalogue facts."""
@@ -91,7 +117,13 @@ def infer_backend(kind: str, integration_mode: str, native_connectors: Iterable[
         return "dataset"
     if kind in ("database", "connector"):
         return "mcp" if ncs else "http"
-    if kind in ("benchmark", "software", "agent_role", "skill"):
+    if kind == "agent_role":
+        # An agent role is executable — by a model. Mapping it to "none" made all
+        # 53 catalogued roles permanently non-executable metadata; on the agent
+        # backend they resolve whenever a model client is bound, and report
+        # exactly that when one is not.
+        return "agent"
+    if kind in ("benchmark", "software", "skill"):
         # These are declarative in the catalogue: no invocable entrypoint exists.
         return "none"
     if kind == "tool":
@@ -187,18 +219,22 @@ class CatalogueProvider:
         backend = infer_backend(kind, mode, ncs, primary)
         entrypoint = ""
         server = ""
-        if backend == "python":
+        deps = lst("external_deps")
+        hosts = tuple(d.lower() for d in deps if "." in d and " " not in d)
+        if backend in ("python", "subprocess"):
+            # Subprocess components got no entrypoint at all, while the backend
+            # requires "module:function" to build a call — so all 56 of them
+            # were unexecutable through the normal path by construction.
             entrypoint = f"{module_for_source(primary, rel)}:{name}"
         elif backend == "mcp":
             server = ncs[0] if ncs else ""
             entrypoint = name
+        elif backend == "http":
+            server = http_server_for(hosts)
 
         py_reqs: tuple[str, ...] = ()
         if backend == "python" and self.repos_root and rel:
             py_reqs = scan_module_imports(self.repos_root, rel)
-
-        deps = lst("external_deps")
-        hosts = tuple(d.lower() for d in deps if "." in d and " " not in d)
 
         cid = f"{slug(primary) or 'unknown'}.{kind}.{slug(name)}"
         return ComponentManifest(
