@@ -325,6 +325,14 @@ class PublicAPIProvider(ProviderBase):
             )
 
 
+def source_for(manifest: Any) -> PublicSource | None:
+    """The typed source behind a connector manifest, if it is one of ours."""
+    cid = str(getattr(manifest, "id", "") or "")
+    if cid.startswith("public.connector."):
+        return BY_KEY.get(cid.rsplit(".", 1)[-1])
+    return None
+
+
 def render_call(source_key: str, operation: str, **kwargs: Any) -> dict[str, Any]:
     """Arguments for HTTPBackend.invoke for a named operation."""
     src = BY_KEY[source_key]

@@ -15,7 +15,7 @@ from .policy import (Authorization, AuthorizationRequest, LicensePolicy,
 from .registry import Capability, CapabilityRegistry
 from .status import ExecutionStatus, LifecycleState, RunOutcome, ScientificVerdict
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 __all__ = [
     "BioAgent",

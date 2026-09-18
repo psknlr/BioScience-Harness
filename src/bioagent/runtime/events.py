@@ -37,6 +37,12 @@ class EventType(str):
     EVALUATION_COMPLETED = "EvaluationCompleted"
     COMPONENT_PROMOTED = "ComponentPromoted"
     COMPONENT_QUARANTINED = "ComponentQuarantined"
+    PLANNER_FALLBACK = "PlannerFallback"       # spec asked for a planner it did not get
+    DATAFLOW_FAILED = "DataflowFailed"         # a step referenced data that was unavailable
+    AGENT_TURN = "AgentTurn"                   # one model turn of an agent-role component
+    AGENT_MESSAGE = "AgentMessage"             # a message between agents in an orchestration
+    MEMORY_WRITTEN = "MemoryWritten"
+    SYNTHESIS_COMPLETED = "SynthesisCompleted"
     RUN_COMPLETED = "RunCompleted"
 
 

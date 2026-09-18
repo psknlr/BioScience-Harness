@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Plan, PlannerPlugin, PlanStep, register_planner
+from .base import Plan, PlanContext, PlannerPlugin, PlanStep, register_planner
 
 
 @register_planner
@@ -30,12 +30,17 @@ class HeuristicPlanner(PlannerPlugin):
         b = self.backends.for_component(m)
         return bool(b is not None and b.available())
 
-    def plan(self, task: str, registry: Any, *, max_steps: int = 5) -> Plan:
+    def plan(self, task: str, registry: Any, *, max_steps: int = 5,
+             context: PlanContext | None = None) -> Plan:
         from ..status import LifecycleState
 
+        excluded = set(context.excluded) if context else set()
         candidates: list[Any] = []
         for kind in self.PREFERRED_KINDS:
-            candidates.extend(registry.search(task, kind=kind, limit=max_steps * 3))
+            # Exclude *before* ranking so the next-best candidate is reached.
+            # Filtering the top-k afterwards could only shrink the plan.
+            candidates.extend(m for m in registry.search(task, kind=kind, limit=max_steps * 3)
+                              if m.id not in excluded)
 
         def score(m: Any) -> tuple[int, int, int]:
             ready = 0 if (self.prefer_ready and m.state in
@@ -63,5 +68,7 @@ class HeuristicPlanner(PlannerPlugin):
                            f"({m.provider.project or 'unknown'}, state={m.state.value})")))
             if len(steps) >= max_steps:
                 break
-        return Plan(task=task, steps=steps, planner=self.name,
-                    notes=f"selected {len(steps)} of {len(candidates)} candidates")
+        notes = f"selected {len(steps)} of {len(candidates)} candidates"
+        if excluded:
+            notes += f"; excluded {len(excluded)} from earlier attempts"
+        return Plan(task=task, steps=steps, planner=self.name, notes=notes)

@@ -29,7 +29,7 @@ KINDS = ("tool", "skill", "dataset", "database", "software", "benchmark",
 
 #: Execution backends a component may declare.
 BACKENDS = ("python", "mcp", "http", "container", "dataset", "subprocess",
-            "remote_agent", "none")
+            "agent", "remote_agent", "none")
 
 
 class _Pending(dict):
@@ -92,6 +92,13 @@ class RuntimeSpec:
             errs.append("runtime.server or entrypoint required for the mcp backend")
         if self.backend == "container" and not self.image:
             errs.append("runtime.image required for the container backend")
+        if self.backend == "http" and not self.server:
+            # An http component with no endpoint passed validation, resolved,
+            # and only failed at invocation with "declares no http(s) server".
+            # A component that cannot name its server is not a valid component.
+            errs.append("runtime.server (base URL) required for the http backend")
+        if self.backend == "subprocess" and self.entrypoint and ":" not in self.entrypoint:
+            errs.append("runtime.entrypoint for the subprocess backend must be 'module:function'")
         return errs
 
 

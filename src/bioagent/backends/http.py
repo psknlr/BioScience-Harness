@@ -267,14 +267,42 @@ class HTTPBackend(Backend):
                params: Mapping[str, Any] | None = None, json_body: Any = None,
                headers: Mapping[str, str] | None = None, accept: str = "application/json",
                graphql: str | None = None, variables: Mapping[str, Any] | None = None,
-               use_cache: bool = True, **_: Any) -> Any:
+               use_cache: bool = True, operation: str | None = None, **extra: Any) -> Any:
         """Execute against the component's declared server (base URL).
+
+        `operation=` selects one of a public connector's typed operations and
+        renders it from the remaining keyword arguments — the path from
+        `Runtime` and the planner to the 45 declared operations. `render_call`
+        existed but nothing on the execution side ever called it, so a planner
+        could name a connector and still had no way to name the call.
 
         `graphql=` turns the call into a POST with {query, variables}. Any host
         actually contacted must be in `permissions.network`, which the policy
         kernel has already checked — this is a second, local guard.
         """
         t0 = time.perf_counter()
+        if operation is not None:
+            from ..providers.public_apis import source_for
+
+            src = source_for(manifest)
+            if src is None:
+                return self._result(manifest, ExecutionStatus.FAILED, t0,
+                                    error=(f"{manifest.id} is not a typed public connector; "
+                                           "pass path=/params= instead of operation="))
+            try:
+                rendered = src.op(operation).render(**{k: v for k, v in extra.items()
+                                                       if v is not None})
+            except KeyError as exc:
+                return self._result(manifest, ExecutionStatus.FAILED, t0, error=str(exc))
+            except ValueError as exc:
+                return self._result(manifest, ExecutionStatus.FAILED, t0,
+                                    error=f"operation {operation!r}: {exc}")
+            path = rendered["path"]
+            method = rendered["method"]
+            params = {**(params or {}), **rendered["params"]}
+            accept = rendered["accept"]
+            graphql = rendered.get("graphql", graphql)
+            variables = rendered.get("variables", variables)
         base = (manifest.runtime.server or "").rstrip("/")
         if not base.startswith(("http://", "https://")):
             return self._result(manifest, ExecutionStatus.UNAVAILABLE, t0,

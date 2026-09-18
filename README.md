@@ -1,4 +1,88 @@
-# bioagent-harness v2.3 — a composable harness for biomedical AI agents
+# bioagent-harness v2.4 — a composable harness for biomedical AI agents
+
+## v2.4 — agent runtime
+
+v2.3 made the execution layer honour the declarative layer. This release adds
+the layer the review found missing: the harness could run an ordered list of
+components, but not an *agent*. Pinned by `tests/test_v24_agent_runtime.py`,
+exercised with a scripted model client — nothing here needs the network.
+
+**Steps consume each other's outputs**
+- `${steps.<component_id>.output.<path>}` (and `${steps.<n>...}`, `${task}`) in
+  a step's arguments is bound at execution time from earlier results, so a
+  planner can write *"look up TP53, then query Open Targets with the id Ensembl
+  returns"* without knowing the id in advance. A reference to a step that did
+  not run or did not succeed, or a path that does not exist, fails *that step*
+  with the reason — the backend is never handed a literal template string.
+
+**The planner plans calls, not just components**
+- The LLM planner presents each candidate's argument surface (the 45 typed
+  operations for public connectors, declared inputs otherwise) and returns
+  `arguments` per step, including cross-step references.
+- Retries feed back. Earlier attempts' failures, the critique and its retry hint
+  reach the planner as a `PlanContext`; exclusion happens *before* ranking, so a
+  retry reaches the next-best candidate instead of shrinking toward zero; and a
+  step blocked by an unresolved input is not treated as a broken component.
+- `AgentSpec(planner="llm")` now actually plans with a model when the runtime
+  has one (`Runtime(llm_client=...)`, `AgentSpec.model`). The old
+  try/except-TypeError construction silently produced a client-less planner
+  that ran heuristically. When no client is bound the fallback is recorded in
+  `Plan.degraded` and a `PlannerFallback` event; `require_model=True` refuses
+  to run instead.
+
+**Agent roles execute**
+- All 53 catalogued `agent_role` components move from `backend="none"` to the
+  new `agent` backend: a bounded tool-use loop over the model client whose
+  every tool call goes back through `Runtime.invoke` (resolved, policy-gated,
+  recorded). Other roles may be among a role's tools — agent-as-tool — and a
+  role may hand off the whole task to a role it is permitted to reach. Without a
+  model client the backend is UNAVAILABLE and says so; a role that never
+  reaches a final answer is a FAILED call. `remote_agent` gets an honest
+  transport-injected backend on the `MCPBackend` pattern.
+- `Orchestrator` runs a manager / workers / critic team over that: delegation
+  as policy-gated invocations, every task, result, handoff and critique as an
+  `AgentMessage` in the transcript and in provenance, one shared
+  `WorkingMemory`, a critic rejection triggering a bounded revision round.
+
+**Memory is a subsystem, not a directory**
+- `WorkingMemory` (per run or team) and `EpisodicMemory` (persistent JSON
+  Lines, written through the `Workspace` trust boundary, term-overlap search
+  with recency tiebreak — it says so, it is not an embedding index). Runs are
+  remembered; planners and agents recall.
+
+**Runs end in an answer**
+- `EvidenceSynthesizer` integrates step results into `RunReport.synthesis`: an
+  answer, findings each citing the step they rest on, conflicts, uncertainty.
+  With a model the integration is written from the structured evidence and any
+  finding that does not cite a real step is dropped; without one it is a
+  deterministic aggregation. Its verdict is never ACCEPTED — synthesis
+  integrates evidence, it does not validate it.
+
+**Concrete bugs from the review**
+- `SubprocessBackend` ran `python -I`, which drops the working directory from
+  `sys.path`, so `cwd=<upstream root>` never made an un-installed upstream
+  checkout importable — "invoke in place" failed with `ModuleNotFoundError`.
+  The root is now put on the path explicitly inside the isolated interpreter.
+  The same fix exposed that the generated call JSON-encoded its arguments twice.
+- The catalogue gave its 56 subprocess components no entrypoint while the
+  backend required `module:function`; all 56 now have one.
+- 222 http components shipped with `server=""` and passed validation. `http`
+  now requires a server; the catalogue derives one (a typed public source's
+  base URL where the host matches, the host root otherwise); the single
+  component declaring no host at all is quarantined rather than resolved.
+- `ContainerBackend` reported the missing runtime before the missing
+  entrypoint, so its own regression test failed on machines without Docker.
+- `HTTPBackend.invoke(operation=...)` dispatches a public connector's typed
+  operation — `render_call` existed and nothing on the execution side called it.
+
+**What this still is not**
+- Executing the 817 python and 56 subprocess upstream tools needs those
+  projects installed; `scripts/entrypoint_census.py` measures IMPORTABLE /
+  CALLABLE on the machine it runs on and this repository does not vendor them.
+- The 405 skills, 155 benchmarks and 113 software components remain
+  declarative. A skill needs a host-agent interpreter and a benchmark a scorer;
+  neither is claimed here.
+- Evolution remains controlled *manifest* evolution — it does not write code.
 
 ## v2.3 — execution semantics
 
@@ -191,11 +275,16 @@ Nine v1 defects were reproduced empirically and fixed; each has a regression tes
       data/                packaged runtime data (the capability catalogue)
       runtime/
         component.py       ComponentManifest (the one composable unit)
+        dataflow.py        ${steps.<id>.output.<path>} binding between steps
+        memory.py          WorkingMemory (per run/team) + EpisodicMemory (persistent)
+        orchestrator.py    manager / workers / critic teams with message passing
+        synthesis.py       EvidenceSynthesizer: the run's answer, with provenance
         registry.py        ComponentRegistry / Resolver / Loader
         events.py          event-sourced provenance with graph replay
         hmr.py             transactional hot reload + LazyComponentSet
         agentspec.py       AgentSpec (data) + Runtime (executes any spec)
-      backends/            python | mcp | dataset | subprocess | container | none
+      backends/            python | mcp | http | dataset | subprocess | container |
+                           agent | remote_agent | none
       providers/           discovery from catalogue rows and SKILL.md trees
       planners/            self-registering plugins: heuristic, llm
       evolution/           propose -> test -> benchmark -> policy -> promote
@@ -223,6 +312,9 @@ Nine v1 defects were reproduced empirically and fixed; each has a regression tes
                                      step arguments, candidate isolation, dependency
                                      propagation, dataset probing, deny-by-default,
                                      promotion gates, verdict honesty
+    tests/test_v24_agent_runtime.py  dataflow, planner feedback + arguments, agent
+                                     roles, orchestration, memory, synthesis, typed
+                                     http dispatch — all against a scripted model
 
 Measuring the catalogue's python entrypoints:
 
